@@ -1,0 +1,206 @@
+---
+  title: "showing overlaid coverage profiles"
+author: "Wandrille Duchemin"
+date: "2023-09-12"
+output: html_document
+---
+  
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+loading and setup
+
+```{r libraries }
+library(rtracklayer)
+library(GenomicRanges)
+library(ggplot2)
+library(gridExtra)
+library(plotly)
+library(RColorBrewer)
+library(AnnotationHub)
+source("coverage_viewer_utils.R")
+
+
+ah <- AnnotationHub() 
+## you can setup a local cache if you do not have internet access
+## eg. with:
+# ah <- AnnotationHub(localHub=TRUE)
+# setAnnotationHubOption("CACHE", "/path/to/cache")
+
+
+## loading up specific annotation we will use.
+## This is set up for human genes but should be changed acccording to your data.
+refseq_tx = ah[["AH5040"]] ## hg19 refseq transcripts annotations 
+orgdb <- ah[["AH100408"]] ## human gene names annotations
+
+# see these for more details on how to decide which AH you need:
+#  https://kasperdanielhansen.github.io/genbioconductor/html/AnnotationHub.html
+#  https://bioconductor.org/packages/devel/bioc/vignettes/AnnotationHub/inst/doc/AnnotationHub-HOWTO.html
+# https://bioconductor.org/packages/devel/bioc/vignettes/AnnotationHub/inst/doc/AnnotationHub.html
+
+```
+
+loading sample info, expected from a csv file with the following columns:
+ * sampleID : the sample ID
+ * coverageFile : a bigWig file
+
++ any factor columns you may want to use to group tracks 
+
+
+Here we will use a toy dataset correponding to coverage data of huan chromosome 17, extracted from the data of GEO series [GSE181905](https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE181905).
+
+
+```{r}
+## reading sample information
+
+folder = "toy_dataset/"
+
+sample_table = read.csv( paste0( folder , "GSE181905_bigWig_files.csv" ))
+row.names(sample_table) = sample_table$sampleID
+
+sample_table$condition = as.factor(sample_table$condition)
+sample_table$replicate = as.factor(sample_table$replicate)
+
+head( sample_table )
+```
+
+## configuration
+
+First some about the graphical config:
+```{r}
+# to prevent having too many points to plot
+# we can represent only the average over N points : 
+subsampling_factor = 10  # set to 1 to plot all positions
+
+# we will group tracks by categories and create buttons to toggle visibility of each category.
+# define here the columns which should be used to define the categories:
+categoryButton_columns = c("condition" , 'replicate')
+
+notFactor = which( sapply( sample_table[ , categoryButton_columns ]  , class) !='factor' )
+if(length(notFactor)>0){stop(paste("ERROR:",categoryButton_columns[notFactor],"are not factors. columns for buttons must be factors."))}
+
+
+# you can map colors and dashes to columns.
+# NOTES:
+#  * current code currently restricts to 12 colors and 4 dahes type.
+#    you can override this and provide your own palette / dashes by creating a color_dashes_table dataframe with sampleID as row names, a color and a dash column
+# 
+#  * if you don't want to make the color or dash change, set the color_column or dashes_column to NULL 
+color_column = 'condition'
+dashes_column = 'replicate'
+
+color_dashes_table = make_color_dashes_table( sample_table, color_column , dashes_column )
+```
+
+Define the chromosome, start and end of the window you want to visualize
+
+For example: [CDK12](https://grch37.ensembl.org/Homo_sapiens/Gene/Summary?db=core;g=ENSG00000167258;r=17:37617764-37721160):
+  
+  * start : 37617764 (-1000 nt to have a look around )
+  * end : 37721160 (+1000 nt to have a look around )
+
+> this data uses the [hg19/Grch37 genome version](https://grch37.ensembl.org/Homo_sapiens/Info/Index?db=core); choose something appropriate fro you own data.
+
+```{r}
+chromosome = 'chr17'
+window_start = 37617764-1000
+window_end = 37721160+1000
+```
+
+## load transcripts on this window
+
+```{r}
+start_time <- Sys.time()
+
+## this call loads all transcripts in the defined region from the refseq_tx 
+## and creates dataframe with plotting info for the transcripts (exons boxes, links between exons and transcripts labels)
+## NB: this presumes that the annotation object uses refseq ids, but can be changed with the key argument 
+TX_list  = load_transcript_tracks(chromosome ,
+                                  window_start , 
+                                  window_end , 
+                                  refseq_tx , 
+                                  orgdb , key = "REFSEQ" )
+
+TX_exons = TX_list[['exons']] # exons boxes 
+TX_links = TX_list[['links']] # links between exons
+TX_names = TX_list[['names']] # transcripts labels
+
+end_time <- Sys.time()
+print(paste( 'loading transcripts' , round(end_time-start_time,1) , 's') )
+start_time <- Sys.time()
+```
+## load coverages on this window
+
+```{r}
+start_time <- Sys.time()
+tmp = paste0(folder,sample_table$coverageFile)
+names(tmp) = sample_table$sampleID 
+
+coverageTracks = loadCoverageTracks( chromosome, window_start, window_end , tmp , subsample_factor = subsampling_factor  )
+
+end_time <- Sys.time()
+print(paste( 'loading coverages' , round(end_time-start_time,1) , 's') )
+```
+## plotting
+
+```{r}
+
+## seting up scale for coverage tracks and transcript annotations
+max_y = max( coverageTracks[,-c(1)] )
+min_y = -max_y/6#-max( TX_exons$y )-0.5
+
+yscale = min_y/ (max( TX_exons$y )+1)
+
+## setting up x-scale breaks.
+main_breaks = 1000
+minor_breaks = 250
+
+
+###################################################################################
+
+fig <- plot_ly(coverageTracks, x = ~pos , type='scatter',mode='lines', visible = F) 
+
+trace_index_list = list() ## list storing tracks index to create button that makes them appear/disappear
+traceI = 1
+
+## adding tracks 
+for( sampleID in row.names(sample_table)){
+  
+  fig <- fig %>% add_trace(y = as.formula(paste0("~",sampleID)) , 
+                           name = sampleID, 
+                           visible = T,
+                           line = list(color = color_dashes_table[sampleID , "color"], 
+                                       width = 1,
+                                       dash = color_dashes_table[sampleID , "dash"] ))
+  
+  for( column in categoryButton_columns){ ## storing tracks index to create button that makes them appear/disappear
+    trace_index_list[[ as.character(sample_table[sampleID , column]) ]] = c( trace_index_list[[ as.character( sample_table[sampleID , column] ) ]],
+                                                              traceI ) 
+  }
+  traceI = traceI+1
+}
+
+## creating the button for each categories 
+updatemenus = add_toggle_buttons( trace_index_list , traceI-1  )
+
+
+
+fig <- fig %>% layout(title = paste0( chromosome ,':',window_start,'-',window_end, ' - average over ' , subsampling_factor, 'nt.'), showlegend = FALSE,
+                      updatemenus = updatemenus) 
+
+fig = add_transcript_annotations( fig , TX_exons , TX_links , TX_names)
+
+fig
+```
+
+```{r}
+library(htmlwidgets)
+
+suffix = ".test"
+
+outName = paste0('region_',paste0( chromosome ,':',window_start,'-',window_end),suffix,".html")
+print(paste("plot written to",outName))
+saveWidget(fig,outName , selfcontained = T)
+
+```

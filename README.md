@@ -8,6 +8,7 @@ These plots can be exported to static html to be shared with anybody without the
 ![a gif demonstrating the coverage viewer](coverage_viewer_demo.gif)
 
 
+You can also get the [html file for this demo](example_viz.html)
 
 The repo is made of two main code files:
 
